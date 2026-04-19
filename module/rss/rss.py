@@ -106,32 +106,6 @@ async def find_youtube_iframe(page_url: str):
     return None
 
 
-def _get_cookies_path() -> str | None:
-    """
-    Cookie resolution order:
-    1. YT_COOKIES env var (base64-encoded cookies.txt) — for Render/env-based deploys
-    2. ./cookies.txt in the repo root — works in Docker (COPY . . copies it in)
-    3. /app/cookies.txt — explicit Docker workdir path fallback
-    """
-    import base64
-    yt_cookies_env = os.environ.get("YT_COOKIES", "").strip()
-    if yt_cookies_env:
-        path = "/tmp/yt_cookies.txt"
-        try:
-            with open(path, "w") as f:
-                f.write(base64.b64decode(yt_cookies_env).decode("utf-8"))
-            print("[YouTube] Using cookies from YT_COOKIES env var.")
-            return path
-        except Exception as e:
-            print(f"[YouTube] Failed to decode YT_COOKIES: {e}")
-    for candidate in ["./cookies.txt", "/app/cookies.txt"]:
-        if os.path.exists(candidate):
-            print(f"[YouTube] Using cookies file: {candidate}")
-            return candidate
-    print("[YouTube] No cookies found.")
-    return None
-
-
 async def download_and_send_video(
     app: Client,
     chat_id,
@@ -139,85 +113,35 @@ async def download_and_send_video(
     caption: str,
     safe_id: str,
 ) -> bool:
-    cookies_path = _get_cookies_path()
-
-    if not cookies_path:
-        print("[YouTube] No cookies found — skipping YouTube download (cookies required on server IPs).")
-        return False
-
-    # PO Token from env (optional but helps on heavily restricted IPs)
-    po_token = os.environ.get("YT_PO_TOKEN", "").strip()
-
-    base_opts = {
-        # Do NOT restrict ext= here — YouTube on server IPs often only serves webm.
-        # Let yt-dlp pick whatever is available, then ffmpeg merges to mp4.
-        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-        "merge_output_format": "mp4",
+    ydl_opts = {
+        "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+        "outtmpl": f"/tmp/ytvideo_{safe_id}.%(ext)s",
         "quiet": True,
-        "no_warnings": True,
-        "cookiefile": cookies_path,
-        "retries": 3,
-        "fragment_retries": 3,
-        "sleep_interval": 3,
-        "max_sleep_interval": 10,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        },
+        "merge_output_format": "mp4",
     }
-
-    # Client order: ios is least restricted on server IPs with valid cookies
-    CLIENTS_TO_TRY = ["ios", "android", "web"]
+    if os.path.exists("./cookies.txt"):
+        ydl_opts["cookiefile"] = "./cookies.txt"
 
     video_path = None
-    for client in CLIENTS_TO_TRY:
-        ext_args: dict = {"player_client": [client]}
-        if po_token and client in ("web", "ios"):
-            ext_args["po_token"] = [f"{client}+{po_token}"]
-
-        ydl_opts = {
-            **base_opts,
-            "extractor_args": {"youtube": ext_args},
-            "outtmpl": f"/tmp/ytvideo_{safe_id}_{client}.%(ext)s",
-        }
-        try:
-            print(f"[YouTube] Trying client={client} ...")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = await asyncio.to_thread(ydl.extract_info, yt_url, True)
-                video_path = ydl.prepare_filename(info)
-            # yt-dlp may merge to .mp4 even if outtmpl says otherwise
-            if not os.path.exists(video_path):
-                mp4 = video_path.rsplit(".", 1)[0] + ".mp4"
-                video_path = mp4 if os.path.exists(mp4) else None
-            if not video_path:
-                print(f"[YouTube] client={client} — file missing after download")
-                continue
-            await app.send_video(chat_id=chat_id, video=video_path, caption=caption)
-            return True
-        except Exception as e:
-            err = str(e)
-            print(f"[YouTube] client={client} failed: {err}")
-            # If cookies are explicitly rejected, no point trying more clients
-            if "cookies are no longer valid" in err or "Sign in to confirm" in err:
-                print("[YouTube] Cookies invalid/expired — update YT_COOKIES env var.")
-                break
-            if video_path and os.path.exists(video_path):
-                try:
-                    os.remove(video_path)
-                except Exception:
-                    pass
-            video_path = None
-
-    if video_path and os.path.exists(video_path):
-        try:
-            os.remove(video_path)
-        except Exception:
-            pass
-    print(f"[YouTube] All clients failed for {yt_url}")
-    return False
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = await asyncio.to_thread(ydl.extract_info, yt_url, True)
+            video_path = ydl.prepare_filename(info)
+        if not os.path.exists(video_path):
+            mp4 = video_path.rsplit(".", 1)[0] + ".mp4"
+            if os.path.exists(mp4):
+                video_path = mp4
+        await app.send_video(chat_id=chat_id, video=video_path, caption=caption)
+        return True
+    except Exception as e:
+        print(f"[YouTube] yt-dlp failed for {yt_url}: {e}")
+        return False
+    finally:
+        if video_path and os.path.exists(video_path):
+            try:
+                os.remove(video_path)
+            except Exception:
+                pass
 
 
 # ─── Thumbnail helper ─────────────────────────────────────────────────────────
