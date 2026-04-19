@@ -106,6 +106,53 @@ async def find_youtube_iframe(page_url: str):
     return None
 
 
+def _get_cookies_path() -> str | None:
+    """Write YT_COOKIES env-var (base64) to /tmp and return path, or find cookies.txt."""
+    import base64
+    yt_cookies_env = os.environ.get("YT_COOKIES", "").strip()
+    if yt_cookies_env:
+        path = "/tmp/yt_cookies.txt"
+        try:
+            with open(path, "w") as f:
+                f.write(base64.b64decode(yt_cookies_env).decode("utf-8"))
+            return path
+        except Exception:
+            pass
+    if os.path.exists("./cookies.txt"):
+        return "./cookies.txt"
+    return None
+
+
+def _install_nodejs_if_missing() -> None:
+    """
+    Try to install Node.js via pip (nodeenv) so yt-dlp can solve
+    YouTube's n-challenge without a system Node install.
+    Only runs once per process lifetime.
+    """
+    import shutil
+    import subprocess
+    if shutil.which("node"):
+        return  # already available
+    if getattr(_install_nodejs_if_missing, "_tried", False):
+        return
+    _install_nodejs_if_missing._tried = True
+    try:
+        print("[YouTube] Node.js not found — installing nodeenv...")
+        subprocess.run(
+            ["pip", "install", "nodeenv", "--quiet", "--break-system-packages"],
+            check=True, timeout=60,
+        )
+        subprocess.run(
+            ["nodeenv", "/tmp/nodeenv", "--prebuilt", "--quiet"],
+            check=True, timeout=120,
+        )
+        node_bin = "/tmp/nodeenv/bin"
+        os.environ["PATH"] = node_bin + os.pathsep + os.environ.get("PATH", "")
+        print("[YouTube] Node.js installed via nodeenv.")
+    except Exception as e:
+        print(f"[YouTube] Could not install Node.js: {e}")
+
+
 async def download_and_send_video(
     app: Client,
     chat_id,
@@ -113,36 +160,23 @@ async def download_and_send_video(
     caption: str,
     safe_id: str,
 ) -> bool:
-    # ── Build cookies file from env var if present (for server deployments like Render) ──
-    cookies_path = "/tmp/yt_cookies.txt"
-    yt_cookies_env = os.environ.get("YT_COOKIES", "").strip()
-    if yt_cookies_env:
-        import base64
-        try:
-            with open(cookies_path, "w") as _f:
-                _f.write(base64.b64decode(yt_cookies_env).decode("utf-8"))
-        except Exception:
-            cookies_path = None
-    elif os.path.exists("./cookies.txt"):
-        cookies_path = "./cookies.txt"
-    else:
-        cookies_path = None
+    _install_nodejs_if_missing()
+    cookies_path = _get_cookies_path()
 
-    ydl_opts = {
-        # Prefer lower res on server IPs — high-res formats are more restricted
-        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+    # Client fallback chain — try each until one works.
+    # ios/mweb don't need JS challenge solving; they are the most server-friendly.
+    CLIENTS_TO_TRY = ["ios", "mweb", "web_creator", "android_vr"]
+
+    base_opts = {
+        "format": "best[height<=720][ext=mp4]/best[height<=720]/best",
         "outtmpl": f"/tmp/ytvideo_{safe_id}.%(ext)s",
-        "quiet": True,
+        "quiet": False,
+        "no_warnings": False,
         "merge_output_format": "mp4",
-        # Use TV client — avoids bot-check prompts that affect web/android clients
-        "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
-        # Retry with sleep to survive 429 rate limits on datacenter IPs
-        "retries": 6,
-        "fragment_retries": 6,
-        "sleep_interval": 5,
-        "max_sleep_interval": 15,
-        "sleep_interval_requests": 2,
-        # Spoof a real browser user-agent
+        "retries": 4,
+        "fragment_retries": 4,
+        "sleep_interval": 4,
+        "max_sleep_interval": 12,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -152,28 +186,42 @@ async def download_and_send_video(
         },
     }
     if cookies_path:
-        ydl_opts["cookiefile"] = cookies_path
+        base_opts["cookiefile"] = cookies_path
 
     video_path = None
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = await asyncio.to_thread(ydl.extract_info, yt_url, True)
-            video_path = ydl.prepare_filename(info)
-        if not os.path.exists(video_path):
-            mp4 = video_path.rsplit(".", 1)[0] + ".mp4"
-            if os.path.exists(mp4):
-                video_path = mp4
-        await app.send_video(chat_id=chat_id, video=video_path, caption=caption)
-        return True
-    except Exception as e:
-        print(f"[YouTube] yt-dlp failed for {yt_url}: {e}")
-        return False
-    finally:
-        if video_path and os.path.exists(video_path):
-            try:
-                os.remove(video_path)
-            except Exception:
-                pass
+    for client in CLIENTS_TO_TRY:
+        ydl_opts = {
+            **base_opts,
+            "extractor_args": {"youtube": {"player_client": [client]}},
+            "outtmpl": f"/tmp/ytvideo_{safe_id}_{client}.%(ext)s",
+        }
+        try:
+            print(f"[YouTube] Trying client={client} for {yt_url}")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = await asyncio.to_thread(ydl.extract_info, yt_url, True)
+                video_path = ydl.prepare_filename(info)
+            if not os.path.exists(video_path):
+                mp4 = video_path.rsplit(".", 1)[0] + ".mp4"
+                if os.path.exists(mp4):
+                    video_path = mp4
+            if not os.path.exists(video_path):
+                print(f"[YouTube] client={client} — file not found after download, skipping")
+                video_path = None
+                continue
+            await app.send_video(chat_id=chat_id, video=video_path, caption=caption)
+            return True
+        except Exception as e:
+            print(f"[YouTube] client={client} failed: {e}")
+            if video_path and os.path.exists(video_path):
+                try:
+                    os.remove(video_path)
+                except Exception:
+                    pass
+            video_path = None
+            continue
+
+    print(f"[YouTube] All clients failed for {yt_url}")
+    return False
 
 
 # ─── Thumbnail helper ─────────────────────────────────────────────────────────
