@@ -107,7 +107,12 @@ async def find_youtube_iframe(page_url: str):
 
 
 def _get_cookies_path() -> str | None:
-    """Write YT_COOKIES env-var (base64) to /tmp and return path, or find cookies.txt."""
+    """
+    Cookie resolution order:
+    1. YT_COOKIES env var (base64-encoded cookies.txt) — for Render/env-based deploys
+    2. ./cookies.txt in the repo root — works in Docker (COPY . . copies it in)
+    3. /app/cookies.txt — explicit Docker workdir path fallback
+    """
     import base64
     yt_cookies_env = os.environ.get("YT_COOKIES", "").strip()
     if yt_cookies_env:
@@ -115,11 +120,15 @@ def _get_cookies_path() -> str | None:
         try:
             with open(path, "w") as f:
                 f.write(base64.b64decode(yt_cookies_env).decode("utf-8"))
+            print("[YouTube] Using cookies from YT_COOKIES env var.")
             return path
-        except Exception:
-            pass
-    if os.path.exists("./cookies.txt"):
-        return "./cookies.txt"
+        except Exception as e:
+            print(f"[YouTube] Failed to decode YT_COOKIES: {e}")
+    for candidate in ["./cookies.txt", "/app/cookies.txt"]:
+        if os.path.exists(candidate):
+            print(f"[YouTube] Using cookies file: {candidate}")
+            return candidate
+    print("[YouTube] No cookies found.")
     return None
 
 
@@ -140,7 +149,9 @@ async def download_and_send_video(
     po_token = os.environ.get("YT_PO_TOKEN", "").strip()
 
     base_opts = {
-        "format": "best[height<=720][ext=mp4]/best[height<=720]/best",
+        # Do NOT restrict ext= here — YouTube on server IPs often only serves webm.
+        # Let yt-dlp pick whatever is available, then ffmpeg merges to mp4.
+        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
@@ -158,7 +169,7 @@ async def download_and_send_video(
         },
     }
 
-    # Client order: ios is least restricted on server IPs with cookies
+    # Client order: ios is least restricted on server IPs with valid cookies
     CLIENTS_TO_TRY = ["ios", "android", "web"]
 
     video_path = None
