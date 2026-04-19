@@ -113,14 +113,46 @@ async def download_and_send_video(
     caption: str,
     safe_id: str,
 ) -> bool:
+    # ── Build cookies file from env var if present (for server deployments like Render) ──
+    cookies_path = "/tmp/yt_cookies.txt"
+    yt_cookies_env = os.environ.get("YT_COOKIES", "").strip()
+    if yt_cookies_env:
+        import base64
+        try:
+            with open(cookies_path, "w") as _f:
+                _f.write(base64.b64decode(yt_cookies_env).decode("utf-8"))
+        except Exception:
+            cookies_path = None
+    elif os.path.exists("./cookies.txt"):
+        cookies_path = "./cookies.txt"
+    else:
+        cookies_path = None
+
     ydl_opts = {
-        "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+        # Prefer lower res on server IPs — high-res formats are more restricted
+        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
         "outtmpl": f"/tmp/ytvideo_{safe_id}.%(ext)s",
         "quiet": True,
         "merge_output_format": "mp4",
+        # Use TV client — avoids bot-check prompts that affect web/android clients
+        "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
+        # Retry with sleep to survive 429 rate limits on datacenter IPs
+        "retries": 6,
+        "fragment_retries": 6,
+        "sleep_interval": 5,
+        "max_sleep_interval": 15,
+        "sleep_interval_requests": 2,
+        # Spoof a real browser user-agent
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        },
     }
-    if os.path.exists("./cookies.txt"):
-        ydl_opts["cookiefile"] = "./cookies.txt"
+    if cookies_path:
+        ydl_opts["cookiefile"] = cookies_path
 
     video_path = None
     try:
