@@ -123,36 +123,6 @@ def _get_cookies_path() -> str | None:
     return None
 
 
-def _install_nodejs_if_missing() -> None:
-    """
-    Try to install Node.js via pip (nodeenv) so yt-dlp can solve
-    YouTube's n-challenge without a system Node install.
-    Only runs once per process lifetime.
-    """
-    import shutil
-    import subprocess
-    if shutil.which("node"):
-        return  # already available
-    if getattr(_install_nodejs_if_missing, "_tried", False):
-        return
-    _install_nodejs_if_missing._tried = True
-    try:
-        print("[YouTube] Node.js not found — installing nodeenv...")
-        subprocess.run(
-            ["pip", "install", "nodeenv", "--quiet", "--break-system-packages"],
-            check=True, timeout=60,
-        )
-        subprocess.run(
-            ["nodeenv", "/tmp/nodeenv", "--prebuilt", "--quiet"],
-            check=True, timeout=120,
-        )
-        node_bin = "/tmp/nodeenv/bin"
-        os.environ["PATH"] = node_bin + os.pathsep + os.environ.get("PATH", "")
-        print("[YouTube] Node.js installed via nodeenv.")
-    except Exception as e:
-        print(f"[YouTube] Could not install Node.js: {e}")
-
-
 async def download_and_send_video(
     app: Client,
     chat_id,
@@ -160,23 +130,25 @@ async def download_and_send_video(
     caption: str,
     safe_id: str,
 ) -> bool:
-    _install_nodejs_if_missing()
     cookies_path = _get_cookies_path()
 
-    # Client fallback chain — try each until one works.
-    # ios/mweb don't need JS challenge solving; they are the most server-friendly.
-    CLIENTS_TO_TRY = ["ios", "mweb", "web_creator", "android_vr"]
+    if not cookies_path:
+        print("[YouTube] No cookies found — skipping YouTube download (cookies required on server IPs).")
+        return False
+
+    # PO Token from env (optional but helps on heavily restricted IPs)
+    po_token = os.environ.get("YT_PO_TOKEN", "").strip()
 
     base_opts = {
         "format": "best[height<=720][ext=mp4]/best[height<=720]/best",
-        "outtmpl": f"/tmp/ytvideo_{safe_id}.%(ext)s",
-        "quiet": False,
-        "no_warnings": False,
         "merge_output_format": "mp4",
-        "retries": 4,
-        "fragment_retries": 4,
-        "sleep_interval": 4,
-        "max_sleep_interval": 12,
+        "quiet": True,
+        "no_warnings": True,
+        "cookiefile": cookies_path,
+        "retries": 3,
+        "fragment_retries": 3,
+        "sleep_interval": 3,
+        "max_sleep_interval": 10,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -185,41 +157,54 @@ async def download_and_send_video(
             )
         },
     }
-    if cookies_path:
-        base_opts["cookiefile"] = cookies_path
+
+    # Client order: ios is least restricted on server IPs with cookies
+    CLIENTS_TO_TRY = ["ios", "android", "web"]
 
     video_path = None
     for client in CLIENTS_TO_TRY:
+        ext_args: dict = {"player_client": [client]}
+        if po_token and client in ("web", "ios"):
+            ext_args["po_token"] = [f"{client}+{po_token}"]
+
         ydl_opts = {
             **base_opts,
-            "extractor_args": {"youtube": {"player_client": [client]}},
+            "extractor_args": {"youtube": ext_args},
             "outtmpl": f"/tmp/ytvideo_{safe_id}_{client}.%(ext)s",
         }
         try:
-            print(f"[YouTube] Trying client={client} for {yt_url}")
+            print(f"[YouTube] Trying client={client} ...")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = await asyncio.to_thread(ydl.extract_info, yt_url, True)
                 video_path = ydl.prepare_filename(info)
+            # yt-dlp may merge to .mp4 even if outtmpl says otherwise
             if not os.path.exists(video_path):
                 mp4 = video_path.rsplit(".", 1)[0] + ".mp4"
-                if os.path.exists(mp4):
-                    video_path = mp4
-            if not os.path.exists(video_path):
-                print(f"[YouTube] client={client} — file not found after download, skipping")
-                video_path = None
+                video_path = mp4 if os.path.exists(mp4) else None
+            if not video_path:
+                print(f"[YouTube] client={client} — file missing after download")
                 continue
             await app.send_video(chat_id=chat_id, video=video_path, caption=caption)
             return True
         except Exception as e:
-            print(f"[YouTube] client={client} failed: {e}")
+            err = str(e)
+            print(f"[YouTube] client={client} failed: {err}")
+            # If cookies are explicitly rejected, no point trying more clients
+            if "cookies are no longer valid" in err or "Sign in to confirm" in err:
+                print("[YouTube] Cookies invalid/expired — update YT_COOKIES env var.")
+                break
             if video_path and os.path.exists(video_path):
                 try:
                     os.remove(video_path)
                 except Exception:
                     pass
             video_path = None
-            continue
 
+    if video_path and os.path.exists(video_path):
+        try:
+            os.remove(video_path)
+        except Exception:
+            pass
     print(f"[YouTube] All clients failed for {yt_url}")
     return False
 
