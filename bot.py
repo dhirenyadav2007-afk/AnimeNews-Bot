@@ -98,7 +98,11 @@ db.admin_channels.create_index("channel_id", unique=True, background=True)
 # ─── Client ──────────────────────────────────────────────────────────────────
 
 app = Client("AnimeNewsBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-threading.Thread(target=start_webhook, daemon=True).start()
+
+# Start Flask FIRST so Render's health-check sees the bound port immediately.
+_wh_thread = threading.Thread(target=start_webhook, daemon=True, name="flask-webhook")
+_wh_thread.start()
+time.sleep(1)   # give Flask 1 s to bind before asyncio loop starts
 
 # ─── Conversation state (in-memory, per user) ────────────────────────────────
 
