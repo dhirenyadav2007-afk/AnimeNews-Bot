@@ -13,7 +13,7 @@ BOT_TOKEN = "8649063236:AAHg7jGJBtG0PKt829EcjizgK3cpmScL-CU"
 MONGO_URI = "mongodb+srv://ANI_OTAKU:ANI_OTAKU@cluster0.t3frstc.mongodb.net/?appName=Cluster0"
 
 # ── Owner / Admins ──────────────────────────────
-OWNER_ID = 5556475282           # Single owner (full control)
+OWNER_ID = 7156099919           # Single owner (full control)
 ADMINS   = [5556475282]        # Initial admin list (can be extended via /add_admin)
 
 # ── Force Subscription (FSUB) ───────────────────
